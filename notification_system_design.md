@@ -61,3 +61,77 @@ Response:
   "Authorization": "Bearer <JWT_TOKEN>",
   "Content-Type": "application/json"
 }
+
+
+# Stage 2
+
+### Persistent Storage (DB) Choice
+**Choice:** PostgreSQL (Relational) with Prisma ORM.
+**Explanation:** PostgreSQL provides strong ACID compliance, ensuring that notification states (like read/unread) remain perfectly consistent. Modern PostgreSQL also features robust `JSONB` support, allowing us to store flexible, schema-less metadata for varying notification types ("Result", "Placement", "Event") while maintaining rigid relationships and indexing on core fields.
+
+### Database Schema (Prisma)
+
+```prisma
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Notification {
+  id          String   @id @default(uuid())
+  userId      String   // Foreign key to User table
+  externalId  String   @unique // Maps to 'ID' from evaluation API
+  type        String   // e.g., "Result", "Placement", "Event"
+  message     String
+  timestamp   DateTime @default(now())
+  isRead      Boolean  @default(false)
+
+  // Composite index for ultra-fast unread queries
+  @@index([userId, isRead, timestamp(sort: Desc)])
+}
+
+Scaling Problems & Solutions
+
+
+Problem: Millions of historical notifications will slow down query times and consume disk space.
+Solution: Implement PostgreSQL Table Partitioning by date (e.g., partitioning the Notification table by month). Combine this with a cron job (using a cron_job package) to archive or drop partitions older than 30-60 days.
+
+
+Problem: Running COUNT() on the database for every user session strains the DB's CPU.
+Solution: Cache the unread count in Redis. Update the Redis counter dynamically when a notification is created or marked as read, bypassing PostgreSQL for purely read-heavy badge updates.
+
+
+Problem: Sending an "Event" notification to all students simultaneously will overwhelm the database connections.
+Solution: Utilize a message broker (like RabbitMQ or AWS SQS). The system queues the broadcast, and worker services consume the queue, utilizing Prisma's createMany for efficient batch inserts.
+
+
+DB Queries (Prisma Client & SQL)
+
+1. Fetch Notifications:
+await prisma.notification.findMany({
+  where: { userId: currentUserId },
+  orderBy: { timestamp: 'desc' },
+  take: 50
+});
+SQL-
+SELECT * FROM "Notification" WHERE "userId" = $1 ORDER BY "timestamp" DESC LIMIT 50;
+
+2. Get Unread Count:
+await prisma.notification.count({
+  where: { 
+    userId: currentUserId, 
+    isRead: false 
+  }
+});
+SQL - SELECT COUNT(*) FROM "Notification" WHERE "userId" = $1 AND "isRead" = false;
+
+3. Mark as Read:
+await prisma.notification.update({
+  where: { externalId: notificationId },
+  data: { isRead: true }
+});
+SQL - UPDATE "Notification" SET "isRead" = true WHERE "externalId" = $1;
+
+
+
+
