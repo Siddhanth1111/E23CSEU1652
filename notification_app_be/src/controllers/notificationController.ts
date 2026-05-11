@@ -30,7 +30,9 @@ export const getUnreadCount = async (req: Request, res: Response) => {
 
 export const markNotificationRead = (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
+    // FIX: Explicitly tell TypeScript this is a single string
+    const id = req.params.id as string;
+    
     Log("backend", "info", "controller", `Processing markNotificationRead for ID: ${id}`);
     
     notificationService.markAsRead(id);
