@@ -230,3 +230,82 @@ When the user explicitly opens the notification tray, do not fetch all notificat
 Implementation: Use cursor-based pagination to fetch only the first 10-20 notifications. Further notifications are only queried if the user scrolls to the bottom of the list.
 
 
+
+# Stage 5
+
+### Observed Shortcomings
+1. **Synchronous Blocking:** Processing 50,000 records sequentially in a single loop is incredibly slow. Network calls (`send_email`) and DB inserts will block the main thread, taking hours to complete.
+2. **Lack of Fault Tolerance:** There is no error handling. If `send_email` throws an exception, the entire loop will crash, and the remaining students will not receive their notifications.
+3. **No Retry Mechanism:** Transient network failures or external API timeouts are not accounted for.
+4. **API Rate Limiting:** Hitting an external Email API 50,000 times in a tight loop will trigger rate limits (HTTP 429), causing the external provider to block the requests.
+5. **Partial State Inconsistency:** If `send_email` succeeds but `save_to_db` fails, the user gets an email but no in-app notification, creating a disjointed experience.
+
+### Handling the Failed 200 Students
+If the loop crashed due to an unhandled exception on those 200 failures, the execution halted. To recover, you would have to manually parse logs to identify exactly which IDs failed and which succeeded to avoid sending duplicate emails to the successful ones. If the loop caught the error and continued, those 200 students are permanently missed because there is no retry queue. 
+
+### Redesigning for Reliability and Speed
+To make this system reliable, fault-tolerant, and fast, I would transition to an **Event-Driven Microservices Architecture** using Message Queues (e.g., RabbitMQ or AWS SQS):
+1. **Decoupling:** The main API simply acknowledges the HR's request and pushes a single "Broadcast Event" to a message broker.
+2. **Batch Processing:** A worker service consumes the broadcast, fetches the 50k IDs, and performs a single bulk insert (e.g., Prisma `createMany`) into PostgreSQL to create the in-app notifications instantly.
+3. **Fan-Out Queues:** The worker then pushes 50,000 individual lightweight "Email Tasks" to a dedicated Email Queue.
+4. **Dead Letter Queues (DLQ):** If an email fails, the message goes to a DLQ, which automatically retries the task with exponential backoff without affecting the rest of the system.
+
+### Should DB Save and Email Sending Happen Together?
+**No.** They must be decoupled.
+* **Vastly Different Latencies:** DB inserts are internal and take milliseconds. External Email APIs take hundreds of milliseconds. Tying them together slows down the database transaction to the speed of the external network.
+* **Independent Failure Domains:** If the third-party email provider goes down, it should not prevent the system from saving the in-app notification to the database. Decoupling ensures that one failure doesn't cascade into total feature failure.
+
+
+// Initialization
+RabbitMQ.connect()
+Database.connect()
+
+
+// 1. API Route (Returns to HR instantly)
+
+Function Handle_NotifyAll_API(student_ids, message):
+    payload = { student_ids, message }
+    
+    RabbitMQ.sendToQueue("broadcast_topic", payload)
+    
+    Return HTTP 202 "Processing in background"
+
+
+
+// 2. Broadcast Worker (DB Batch & Fan-out)
+
+RabbitMQ.consume("broadcast_topic", Function(payload):
+    // Save to DB in one massive, fast batch
+    Database.batchInsert(payload.student_ids, payload.message)
+    
+    // Fan-out to individual task queues
+    For each student_id in payload.student_ids:
+        RabbitMQ.sendToQueue("email_queue", { student_id, message: payload.message })
+        RabbitMQ.sendToQueue("websocket_queue", { student_id, message: payload.message })
+)
+
+
+
+// 3. Email Worker (External API + Retries)
+
+RabbitMQ.consume("email_queue", Function(task):
+    Try:
+        ExternalEmailAPI.send(task.student_id, task.message)
+        
+    Catch RateLimitError, TimeoutError:
+        // Push back to queue with a delay (Exponential Backoff)
+        RabbitMQ.sendToQueueWithDelay("email_queue", task, retry_delay)
+        
+    Catch FatalError:
+        // Move unrecoverable errors to Dead Letter Queue for HR to review
+        RabbitMQ.sendToQueue("dead_letter_queue", task)
+)
+
+
+
+// 4. Real-time Worker (In-App Push)
+
+RabbitMQ.consume("websocket_queue", Function(task):
+    // Emit directly to the active user's socket connection
+    WebSocketServer.emitToRoom(task.student_id, "NEW_NOTIFICATION", task.message)
+)
