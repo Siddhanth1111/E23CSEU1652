@@ -202,31 +202,12 @@ Functionally, the syntax is valid, but from a product perspective, it is flawed.
 Notification systems are heavily write-intensive (high volume of inserts). Every time a new notification is inserted, the database must update *every single index*. Adding indexes to every column will drastically degrade `INSERT` and `UPDATE` performance, create write locks, and cause massive storage bloat (the indexes could take up more disk space than the actual data). Indexes should be strictly tailored to frequent `WHERE`, `JOIN`, and `ORDER BY` clauses.
 
 ### SQL Query: Placement Notifications (Last 7 Days)
-
+```sql
 SELECT DISTINCT studentID
 FROM notifications
 WHERE notificationType = 'Placement' 
   AND createdAt >= NOW() - INTERVAL '7 days';
 
 
-
-# Stage 4
-Solutions to Improve Performance
-Fetching notifications heavily on every page load causes a read bottleneck. To resolve this, we must decouple the UI rendering from direct database queries.
-
-1. Cache Unread Counts in Memory (Redis)
-The most common operation on page load is simply checking if the user has new notifications (the badge count).
-
-Implementation: Store a key-value pair in Redis (e.g., unread_count:student:1042). When a notification is created, increment this cache (INCR). When read, decrement it (DECR). The frontend fetches this count in O(1) time without touching the SQL database.
-
-2. Push via WebSockets instead of Client Polling
-Instead of the client requesting data on every page transition, establish a persistent WebSocket connection upon login.
-
-Implementation: The backend pushes new notification payloads directly to the active client socket. The frontend stores this in global state (like React Context or Redux). Page loads read from this local state instead of making network requests.
-
-3. Implement Aggressive Pagination / Cursor-based Fetching
-When the user explicitly opens the notification tray, do not fetch all notifications.
-
-Implementation: Use cursor-based pagination to fetch only the first 10-20 notifications. Further notifications are only queried if the user scrolls to the bottom of the list.
 
 
